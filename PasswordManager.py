@@ -1,12 +1,11 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
-import csv
+import json
 import os
 import base64
-import hashlib
 import secrets
 import string
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
@@ -45,29 +44,23 @@ class CryptoManager:
         return f.decrypt(encrypted_text.encode()).decode('utf-8')
 
     @staticmethod
-    def encrypt_file(filepath: str, key: bytes):
-        """Encrypts an entire file using AES and deletes the plaintext version."""
-        if not os.path.exists(filepath): return
+    def encrypt_data_to_file(filepath: str, data: str, key: bytes):
+        """Encrypts a string blob and writes it directly to disk."""
         f = Fernet(key)
-        with open(filepath, 'rb') as file:
-            original = file.read()
-        encrypted = f.encrypt(original)
-        with open(filepath + ".enc", 'wb') as encrypted_file:
-            encrypted_file.write(encrypted)
-        os.remove(filepath) # Remove plaintext file
+        encrypted = f.encrypt(data.encode('utf-8'))
+        with open(filepath, 'wb') as file:
+            file.write(encrypted)
 
     @staticmethod
-    def decrypt_file(filepath: str, key: bytes):
-        """Decrypts an encrypted file back to plaintext."""
-        enc_filepath = filepath + ".enc"
-        if not os.path.exists(enc_filepath): return
+    def decrypt_data_from_file(filepath: str, key: bytes) -> str:
+        """Reads encrypted bytes from disk and decrypts them in memory."""
+        if not os.path.exists(filepath):
+            return "[]"  # Return empty JSON array if file doesn't exist
         f = Fernet(key)
-        with open(enc_filepath, 'rb') as encrypted_file:
-            encrypted = encrypted_file.read()
-        decrypted = f.decrypt(encrypted)
-        with open(filepath, 'wb') as decrypted_file:
-            decrypted_file.write(decrypted)
-        os.remove(enc_filepath) # Remove encrypted file while in use
+        with open(filepath, 'rb') as file:
+            encrypted = file.read()
+        return f.decrypt(encrypted).decode('utf-8')
+
 
 class PasswordManagerApp:
     def __init__(self, root):
@@ -78,13 +71,12 @@ class PasswordManagerApp:
         self.current_user = None
         self.encryption_key = None
         self.data_filepath = None
-        self.passwords = [] # List of dicts: Title, Password, URL, Notes
+        self.passwords = [] # List of dicts: Title, EncryptedPassword, URL, Notes
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.show_login_screen()
 
     # --- UI ROUTING ---
-
     def clear_screen(self):
         for widget in self.root.winfo_children():
             widget.destroy()
@@ -141,14 +133,13 @@ class PasswordManagerApp:
         search_frame.pack(fill="x", padx=10, pady=5)
         tk.Label(search_frame, text="Search by Title:").pack(side="left")
         self.search_var = tk.StringVar()
-        self.search_var.trace("w", self.filter_treeview)
+        self.search_var.trace_add("write", self.filter_treeview)
         tk.Entry(search_frame, textvariable=self.search_var).pack(side="left", padx=5)
 
-        self.load_csv_data()
+        self.load_data()
         self.refresh_treeview()
 
     # --- AUTHENTICATION ---
-
     def register(self):
         username = self.entry_username.get().strip()
         password = self.entry_password.get().strip()
@@ -170,15 +161,12 @@ class PasswordManagerApp:
             f.write(f"{username},{salt.hex()},{hashed_pw}\n")
         
         # Initialize empty encrypted file for new user
-        user_file = f"{username}_data.csv"
-        with open(user_file, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(["Title", "EncryptedPassword", "URL", "Notes"])
-        
+        user_file = f"{username}_data.enc"
         key = CryptoManager.derive_key(password, salt)
-        CryptoManager.encrypt_file(user_file, key)
+        CryptoManager.encrypt_data_to_file(user_file, "[]", key) # Save empty JSON array
 
         messagebox.showinfo("Success", "Registration successful! You can now log in.")
+        self.entry_password.delete(0, 'end')
 
     def login(self):
         username = self.entry_username.get().strip()
@@ -196,19 +184,17 @@ class PasswordManagerApp:
                     if CryptoManager.hash_password(password, salt) == stored_hash:
                         self.current_user = username
                         self.encryption_key = CryptoManager.derive_key(password, salt)
-                        self.data_filepath = f"{username}_data.csv"
+                        self.data_filepath = f"{username}_data.enc"
                         
-                        # Decrypt file on login
-                        CryptoManager.decrypt_file(self.data_filepath, self.encryption_key)
                         self.show_main_screen()
                         return
                     
         messagebox.showerror("Error", "Invalid username or password.")
+        self.entry_password.delete(0, 'end')
 
     def logout(self):
         if self.current_user:
-            self.save_csv_data()
-            CryptoManager.encrypt_file(self.data_filepath, self.encryption_key)
+            self.save_data()
             self.current_user = None
             self.encryption_key = None
             self.data_filepath = None
@@ -217,39 +203,36 @@ class PasswordManagerApp:
 
     def on_closing(self):
         if self.current_user:
-            self.save_csv_data()
-            CryptoManager.encrypt_file(self.data_filepath, self.encryption_key)
+            self.save_data()
         self.root.destroy()
 
-    # --- DATA MANAGEMENT ---
+    # --- DATA MANAGEMENT (IN-MEMORY) ---
+    def load_data(self):
+        try:
+            json_data = CryptoManager.decrypt_data_from_file(self.data_filepath, self.encryption_key)
+            self.passwords = json.loads(json_data)
+        except InvalidToken:
+            messagebox.showerror("Critical Error", "Data decryption failed. File may be corrupted.")
+            self.passwords = []
+        except json.JSONDecodeError:
+            self.passwords = []
 
-    def load_csv_data(self):
-        self.passwords = []
-        if not os.path.exists(self.data_filepath):
-            return
-        with open(self.data_filepath, 'r', newline='') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                self.passwords.append(row)
-
-    def save_csv_data(self):
-        with open(self.data_filepath, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=["Title", "EncryptedPassword", "URL", "Notes"])
-            writer.writeheader()
-            writer.writerows(self.passwords)
+    def save_data(self):
+        if self.current_user and self.encryption_key:
+            json_data = json.dumps(self.passwords)
+            CryptoManager.encrypt_data_to_file(self.data_filepath, json_data, self.encryption_key)
 
     def refresh_treeview(self, filter_text=""):
         for row in self.tree.get_children():
             self.tree.delete(row)
         for entry in self.passwords:
             if filter_text.lower() in entry['Title'].lower():
-                self.tree.insert("", "end", values=(entry['Title'], entry['URL'], entry['Notes']))
+                self.tree.insert("", "end", values=(entry['Title'], entry.get('URL', ''), entry.get('Notes', '')))
 
     def filter_treeview(self, *args):
         self.refresh_treeview(self.search_var.get())
 
     # --- FEATURES ---
-
     def add_entry_dialog(self):
         self._show_entry_form("Add Entry")
 
@@ -261,11 +244,12 @@ class PasswordManagerApp:
         title = self.tree.item(selected)['values'][0]
         entry = next(e for e in self.passwords if e['Title'] == title)
         decrypted_pw = CryptoManager.decrypt_text(entry['EncryptedPassword'], self.encryption_key)
-        self._show_entry_form("Update Entry", entry['Title'], decrypted_pw, entry['URL'], entry['Notes'], is_update=True)
+        self._show_entry_form("Update Entry", entry['Title'], decrypted_pw, entry.get('URL', ''), entry.get('Notes', ''), is_update=True)
 
     def _show_entry_form(self, action, t="", p="", u="", n="", is_update=False):
         top = tk.Toplevel(self.root)
         top.title(action)
+        top.grab_set() # Prevent interacting with main window until closed
         
         tk.Label(top, text="Title:").grid(row=0, column=0, pady=5)
         title_entry = tk.Entry(top)
@@ -289,10 +273,10 @@ class PasswordManagerApp:
         notes_entry.grid(row=3, column=1, pady=5)
 
         def save():
-            title = title_entry.get()
+            title = title_entry.get().strip()
             password = pass_entry.get()
             if not title or not password:
-                messagebox.showerror("Error", "Title and Password are required.")
+                messagebox.showerror("Error", "Title and Password are required.", parent=top)
                 return
 
             enc_pw = CryptoManager.encrypt_text(password, self.encryption_key)
@@ -304,15 +288,15 @@ class PasswordManagerApp:
                         entry['URL'] = url_entry.get()
                         entry['Notes'] = notes_entry.get()
             else:
-                if any(e['Title'] == title for e in self.passwords):
-                    messagebox.showerror("Error", "Title already exists.")
+                if any(e['Title'].lower() == title.lower() for e in self.passwords):
+                    messagebox.showerror("Error", "Title already exists.", parent=top)
                     return
                 self.passwords.append({
                     "Title": title, "EncryptedPassword": enc_pw,
                     "URL": url_entry.get(), "Notes": notes_entry.get()
                 })
             
-            self.save_csv_data()
+            self.save_data()
             self.refresh_treeview()
             top.destroy()
 
@@ -326,7 +310,7 @@ class PasswordManagerApp:
         title = self.tree.item(selected)['values'][0]
         if messagebox.askyesno("Confirm", f"Delete password for '{title}'?"):
             self.passwords = [e for e in self.passwords if e['Title'] != title]
-            self.save_csv_data()
+            self.save_data()
             self.refresh_treeview()
 
     def reveal_password(self):
@@ -337,23 +321,34 @@ class PasswordManagerApp:
         decrypted_pw = CryptoManager.decrypt_text(entry['EncryptedPassword'], self.encryption_key)
         messagebox.showinfo("Secure Reveal", f"Password for {title}:\n\n{decrypted_pw}")
 
+    def clear_clipboard_timer(self):
+        """Clears the clipboard after a delay."""
+        self.root.clipboard_clear()
+        # Optional: Show a subtle notification that clipboard was cleared.
+
     def copy_password(self):
         selected = self.tree.focus()
         if not selected: return
         title = self.tree.item(selected)['values'][0]
         entry = next(e for e in self.passwords if e['Title'] == title)
         decrypted_pw = CryptoManager.decrypt_text(entry['EncryptedPassword'], self.encryption_key)
+        
         self.root.clipboard_clear()
         self.root.clipboard_append(decrypted_pw)
-        messagebox.showinfo("Copied", "Password copied to clipboard safely!")
+        messagebox.showinfo("Copied", "Password copied to clipboard!\n\nClipboard will clear in 10 seconds.")
+        
+        # Schedule clipboard clear after 10 seconds (10000 milliseconds)
+        self.root.after(10000, self.clear_clipboard_timer)
 
     def generate_random_password(self):
         length = 16
         alphabet = string.ascii_letters + string.digits + string.punctuation
         pwd = ''.join(secrets.choice(alphabet) for _ in range(length))
+        
         self.root.clipboard_clear()
         self.root.clipboard_append(pwd)
-        messagebox.showinfo("Generated", f"Generated 16-char password and copied to clipboard:\n\n{pwd}")
+        messagebox.showinfo("Generated", f"Generated password:\n\n{pwd}\n\nCopied to clipboard. Will clear in 10s.")
+        self.root.after(10000, self.clear_clipboard_timer)
 
 if __name__ == "__main__":
     root = tk.Tk()
